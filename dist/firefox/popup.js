@@ -1,21 +1,524 @@
-/* 弹窗：显示注入状态 / 真实灰度状态 / 切换朗读音色
+/* 弹窗：注入状态 / 真实灰度状态 / 界面语言 / 朗读语言与音色
  *
  * 跨浏览器：Firefox 用 browser.*（Promise 风格），Chrome / Edge 用 chrome.*
  * （Chrome MV3 的 tabs / permissions 同样支持 Promise，所以一套代码两边都能跑）
+ *
+ * 界面语言与朗读语言存在扩展页的 localStorage 里（同源，无需额外权限）。
  */
 
 const api = (typeof browser !== 'undefined' && browser.runtime) ? browser : chrome;
 const ORIGINS = ['https://chat.deepseek.com/*'];
+const SETTINGS_KEY = 'ds-tts-popup-settings';
+const LANGS = UI_LANGS.map((l) => l.code);
 
 const $ = (id) => document.getElementById(id);
-const VOICE_ZH = { mira: '贝壳 · 百变活泼', echo: '白浪 · 明朗坚定', stella: '海星 · 俏皮甜美', tide: '暗潮 · 低沉浑厚' };
 
 // 拼 HTML 前把服务端来的字符串转义掉
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-function setMsg(text, cls) {
-  $('msg').innerHTML = text ? `<span class="${cls || 'muted'}">${text}</span>` : '';
+const state = {
+  uiLang: 'en',
+  voiceLang: 'zh',
+  mode: 'checking',
+  tab: null,
+  st: null,
+  voices: null,
+  voicesTried: false,
+  voiceLangs: [],
+  messages: null,
+  messagesTried: false,
+  sessionMissing: false,
+  bridgeOutdated: false,
+  messagesEmpty: false,
+  selectedMessage: null,
+  downloading: false,
+  audioMsg: null,
+  selectedVoice: null,
+  assistantVoice: null,
+  userVoice: null,
+  audioFormat: 'mp3',
+  wholeDialog: false,
+  saving: false,
+  granting: false,
+  audio: null,
+  msg: null,
+};
+
+/* ---------- 文案 ---------- */
+
+function t(key, vars) {
+  const dict = I18N[state.uiLang] || I18N.en;
+  const raw = dict[key] != null ? dict[key] : (I18N.en[key] != null ? I18N.en[key] : key);
+  return String(raw).replace(/\{(\w+)\}/g, (m, k) => (
+    vars && Object.prototype.hasOwnProperty.call(vars, k) ? String(vars[k]) : m
+  ));
 }
+
+function langName(code) {
+  try {
+    const dn = new Intl.DisplayNames([state.uiLang], { type: 'language' });
+    return dn.of(String(code).replace(/_/g, '-')) || String(code);
+  } catch {
+    return String(code);
+  }
+}
+
+// 俄语等语言的 Intl 名称是小写，下拉框里首字母大写更自然
+function langOptionName(code) {
+  const name = langName(code);
+  return name ? name.charAt(0).toUpperCase() + name.slice(1) : name;
+}
+
+function setMsg(key, vars, cls) {
+  state.msg = { key, vars, cls: cls || 'muted' };
+}
+
+function setRawMsg(text, cls) {
+  state.msg = { raw: String(text || ''), cls: cls || 'muted' };
+}
+
+function shortJson(value) {
+  let out;
+  try { out = typeof value === 'string' ? value : JSON.stringify(value); } catch { out = String(value); }
+  return String(out ?? '').slice(0, 160);
+}
+
+function base64ToBytes(b64) {
+  const binary = atob(b64);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+function saveBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+function formatSize(bytes) {
+  if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+  return Math.max(1, Math.round(bytes / 1024)) + ' KB';
+}
+
+function pcmToWavBytes(pcm, sampleRate = 24000, channels = 1, bitsPerSample = 16) {
+  const blockAlign = channels * bitsPerSample / 8;
+  const dataSize = pcm.length - (pcm.length % blockAlign);
+  const out = new Uint8Array(44 + dataSize);
+  const view = new DataView(out.buffer);
+  const ascii = (offset, text) => {
+    for (let i = 0; i < text.length; i++) out[offset + i] = text.charCodeAt(i);
+  };
+  ascii(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  ascii(8, 'WAVE');
+  ascii(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * blockAlign, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  ascii(36, 'data');
+  view.setUint32(40, dataSize, true);
+  out.set(pcm.subarray(0, dataSize), 44);
+  return out;
+}
+
+function concatPcm(chunks, silenceMs = 500) {
+  const silence = new Uint8Array(Math.round(24000 * 2 * silenceMs / 1000));
+  let total = 0;
+  chunks.forEach((chunk, i) => { total += chunk.length + (i ? silence.length : 0); });
+  const out = new Uint8Array(total);
+  let offset = 0;
+  chunks.forEach((chunk, i) => {
+    if (i) { out.set(silence, offset); offset += silence.length; }
+    out.set(chunk, offset);
+    offset += chunk.length;
+  });
+  return out;
+}
+
+function encodeMp3(pcmBytes) {
+  if (typeof lamejs === 'undefined' || !lamejs.Mp3Encoder) throw new Error('MP3 encoder is not loaded');
+  const samples = new Int16Array(pcmBytes.buffer, pcmBytes.byteOffset, Math.floor(pcmBytes.byteLength / 2));
+  const encoder = new lamejs.Mp3Encoder(1, 24000, 128);
+  const blockSize = 1152;
+  const chunks = [];
+  for (let i = 0; i < samples.length; i += blockSize) {
+    const buf = encoder.encodeBuffer(samples.subarray(i, i + blockSize));
+    if (buf.length) chunks.push(new Uint8Array(buf));
+  }
+  const tail = encoder.flush();
+  if (tail.length) chunks.push(new Uint8Array(tail));
+  return new Blob(chunks, { type: 'audio/mpeg' });
+}
+
+/* ---------- 语音元数据 ---------- */
+
+function voiceLanguages(voice) {
+  const set = new Set();
+  const add = (code) => {
+    if (!code) return;
+    const base = String(code).toLowerCase().split(/[-_]/)[0];
+    if (/^[a-z]{2,3}$/.test(base)) set.add(base);
+  };
+  const langs = voice && voice.languages;
+  if (Array.isArray(langs)) {
+    for (const item of langs) {
+      if (typeof item === 'string') add(item);
+      else if (item && typeof item === 'object') add(item.code || item.lang || item.language || item.locale || item.id || item.value);
+    }
+  } else if (langs && typeof langs === 'object') {
+    Object.keys(langs).forEach(add);
+  }
+  const demos = voice && voice.demo_urls;
+  if (Array.isArray(demos)) {
+    for (const item of demos) {
+      if (item && typeof item === 'object') add(item.lang || item.language || item.code || item.locale);
+    }
+  } else if (demos && typeof demos === 'object') {
+    Object.keys(demos).forEach(add);
+  }
+  return set;
+}
+
+function asDemoUrl(value) {
+  if (!value) return null;
+  if (typeof value === 'string') return value;
+  if (typeof value === 'object') return value.url || value.src || value.href || null;
+  return null;
+}
+
+function demoUrl(voice, lang) {
+  const demos = voice && voice.demo_urls;
+  if (!demos) return null;
+  const base = String(lang).toLowerCase().split(/[-_]/)[0];
+  if (Array.isArray(demos)) {
+    const hit = demos.find((item) => item && typeof item === 'object'
+      && [item.lang, item.language, item.code, item.locale].some((c) => String(c || '').toLowerCase().split(/[-_]/)[0] === base));
+    return asDemoUrl(hit);
+  }
+  if (typeof demos === 'object') {
+    if (demos[lang] !== undefined) return asDemoUrl(demos[lang]);
+    if (demos[base] !== undefined) return asDemoUrl(demos[base]);
+    const key = Object.keys(demos).find((k) => k.toLowerCase().split(/[-_]/)[0] === base);
+    return key ? asDemoUrl(demos[key]) : null;
+  }
+  return asDemoUrl(demos);
+}
+
+function voiceText(voice, lang) {
+  const id = (voice && voice.voice_id) || '';
+  const fb = VOICE_FALLBACK[id] || {};
+  const fallbackKey = (field) => (field === 'name_i18n' ? 'name' : 'desc');
+  const pick = (field) => pickI18n(voice && voice[field], lang)
+    || (fb[lang] && fb[lang][fallbackKey(field)])
+    || pickI18n(voice && voice[field], 'en')
+    || (fb.en && fb.en[fallbackKey(field)])
+    || pickI18n(voice && voice[field], 'zh')
+    || (fb.zh && fb.zh[fallbackKey(field)]);
+  return { name: pick('name_i18n') || id, desc: pick('description_i18n') || '' };
+}
+
+function selectedVoice() {
+  const list = state.voices && Array.isArray(state.voices.voices) ? state.voices.voices : [];
+  return list.find((v) => v.voice_id === state.selectedVoice) || null;
+}
+
+function availableVoiceLangs() {
+  const set = new Set(state.voiceLangs);
+  if (!set.size) ['zh', 'en', 'ru'].forEach((c) => set.add(c));
+  if (state.voiceLang) set.add(state.voiceLang);
+  return [...set];
+}
+
+/* ---------- 设置 ---------- */
+
+function loadSettings() {
+  state.uiLang = detectUiLang();
+  state.voiceLang = state.uiLang;
+  try {
+    const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null') || {};
+    if (LANGS.includes(saved.uiLang)) state.uiLang = saved.uiLang;
+    const voiceLang = String(saved.voiceLang || '').toLowerCase();
+    if (/^[a-z]{2,3}$/.test(voiceLang)) state.voiceLang = voiceLang;
+    if (typeof saved.assistantVoice === 'string') state.assistantVoice = saved.assistantVoice;
+    if (typeof saved.userVoice === 'string') state.userVoice = saved.userVoice;
+    if (saved.audioFormat === 'wav' || saved.audioFormat === 'mp3') state.audioFormat = saved.audioFormat;
+    state.wholeDialog = !!saved.wholeDialog;
+  } catch { /* 设置损坏就回到默认 */ }
+}
+
+function persistSettings() {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({
+      uiLang: state.uiLang,
+      voiceLang: state.voiceLang,
+      assistantVoice: state.assistantVoice,
+      userVoice: state.userVoice,
+      audioFormat: state.audioFormat,
+      wholeDialog: state.wholeDialog,
+    }));
+  } catch { /* 存不了就只在本窗口生效 */ }
+}
+
+function reconcileVoiceLang() {
+  if (!state.voiceLangs.length || state.voiceLangs.includes(state.voiceLang)) return;
+  state.voiceLang = state.voiceLangs.includes(state.uiLang)
+    ? state.uiLang
+    : (state.voiceLangs.includes('zh') ? 'zh' : state.voiceLangs[0]);
+  persistSettings();
+}
+
+/* ---------- 渲染 ---------- */
+
+function applyStatic() {
+  document.documentElement.lang = state.uiLang;
+  document.title = t('appName');
+  document.querySelectorAll('[data-i18n]').forEach((el) => {
+    el.textContent = t(el.getAttribute('data-i18n'));
+  });
+  document.querySelectorAll('[data-i18n-html]').forEach((el) => {
+    el.innerHTML = t(el.getAttribute('data-i18n-html'));
+  });
+}
+
+function renderLangSelects() {
+  const ui = $('uiLang');
+  if (ui.options.length !== UI_LANGS.length) {
+    ui.innerHTML = UI_LANGS.map((l) => `<option value="${esc(l.code)}">${esc(l.label)}</option>`).join('');
+  }
+  ui.value = state.uiLang;
+
+  const langs = availableVoiceLangs();
+  const names = new Map(langs.map((code) => [code, langOptionName(code)]));
+  let collator = null;
+  try { collator = new Intl.Collator(state.uiLang); } catch { /* 按语言码排 */ }
+  langs.sort((a, b) => (collator ? collator.compare(names.get(a), names.get(b)) : a.localeCompare(b)));
+
+  const voiceLang = $('voiceLang');
+  voiceLang.innerHTML = langs.map((code) => `<option value="${esc(code)}">${esc(names.get(code))}</option>`).join('');
+  voiceLang.value = state.voiceLang;
+}
+
+function renderStatus() {
+  const dot = $('dot');
+  const page = $('page');
+  const gray = $('gray');
+  const grant = $('grant');
+  grant.hidden = true;
+  gray.textContent = '';
+
+  if (state.mode === 'checking') {
+    dot.className = 'dot';
+    page.textContent = t('checking');
+    return;
+  }
+  if (state.mode === 'wrongTab') {
+    dot.className = 'dot off';
+    page.innerHTML = t('wrongTab');
+    return;
+  }
+  if (state.mode === 'noPermission') {
+    dot.className = 'dot off';
+    page.innerHTML = t('needPerm');
+    grant.hidden = false;
+    grant.disabled = state.granting;
+    return;
+  }
+  if (state.mode === 'notInjected') {
+    dot.className = 'dot off';
+    page.innerHTML = t('notInjected');
+    return;
+  }
+
+  const st = state.st || {};
+  dot.className = 'dot ' + (st.installed ? 'on' : 'off');
+  page.innerHTML = st.installed
+    ? t('pageUnlocked') + ' · ' + (st.hasToken ? t('loginYes') : t('loginNo'))
+    : t('pageLocked');
+
+  const info = st.gray;
+  if (!info || !info.models) {
+    gray.textContent = t('grayNoCache');
+    return;
+  }
+  const grayed = info.models.some((m) => m.gray);
+  gray.innerHTML = (grayed ? t('grayHas') : t('grayNot')) + `<ul id="models">${info.models
+    .map((m) => `<li>${esc(m.model)}${m.enabled ? '' : esc(t('modelOff'))} · tts_feature = ${esc(String(m.gray))}</li>`)
+    .join('')}</ul>`;
+}
+
+function renderVoiceSection() {
+  const sel = $('voice');
+  const save = $('save');
+  const preview = $('preview');
+  const info = $('voiceInfo');
+  const data = state.voices;
+  const list = data && Array.isArray(data.voices) ? data.voices : [];
+
+  if (!list.length) {
+    sel.innerHTML = `<option>${esc((state.voices || state.voicesTried) ? t('voicesError') : t('loading'))}</option>`;
+    sel.disabled = true;
+    save.disabled = true;
+    preview.disabled = true;
+    preview.title = '';
+    info.textContent = '';
+    return;
+  }
+
+  if (!list.some((v) => v.voice_id === state.selectedVoice)) {
+    const current = list.find((v) => v.voice_id === data.current_voice_id) || list[0];
+    state.selectedVoice = current.voice_id;
+  }
+
+  sel.innerHTML = list.map((voice) => {
+    const text = voiceText(voice, state.voiceLang);
+    const langs = voiceLanguages(voice);
+    const unsupported = langs.size > 0 && !langs.has(state.voiceLang);
+    const label = text.desc ? `${text.name} — ${text.desc}` : text.name;
+    const suffix = unsupported ? '  ' + t('unsupportedVoice', { lang: langName(state.voiceLang) }) : '';
+    return `<option value="${esc(voice.voice_id)}">${esc(label + suffix)}</option>`;
+  }).join('');
+  sel.value = state.selectedVoice;
+  sel.disabled = false;
+  save.disabled = state.saving;
+
+  const voice = selectedVoice();
+  const langs = voice ? voiceLanguages(voice) : new Set();
+  const parts = [];
+  if (langs.size) parts.push(t('supportsCount', { n: langs.size }));
+  if (voice && langs.size && !langs.has(state.voiceLang)) {
+    parts.push(t('unsupportedVoice', { lang: langName(state.voiceLang) }));
+  }
+  info.textContent = parts.join(' · ');
+
+  const url = voice ? demoUrl(voice, state.voiceLang) : null;
+  preview.disabled = state.saving || !url;
+  preview.title = url ? '' : t('previewMissing');
+}
+
+function renderMsg() {
+  const el = $('msg');
+  if (!state.msg) {
+    el.innerHTML = '';
+    return;
+  }
+  let body;
+  if (state.msg.raw != null) {
+    body = esc(state.msg.raw);
+  } else {
+    const vars = {};
+    for (const [key, value] of Object.entries(state.msg.vars || {})) vars[key] = esc(value);
+    body = t(state.msg.key, vars);
+  }
+  el.innerHTML = body ? `<span class="${state.msg.cls}">${body}</span>` : '';
+}
+
+function setAudioMsg(key, vars, cls) {
+  state.audioMsg = { key, vars, cls: cls || 'muted' };
+}
+
+function messageLabel(m) {
+  const who = m.role === 'user' ? t('roleUser') : (m.role === 'assistant' ? t('roleAssistant') : '');
+  const preview = String(m.preview || '').slice(0, 80);
+  return (who ? who + ': ' : '') + preview;
+}
+
+function fillVoiceSelect(select, value, list) {
+  if (!list.length) {
+    select.innerHTML = '';
+    select.disabled = true;
+    return;
+  }
+  select.innerHTML = list.map((voice) => {
+    const name = voiceText(voice, state.voiceLang).name;
+    return `<option value="${esc(voice.voice_id)}">${esc(name)}</option>`;
+  }).join('');
+  if (list.some((v) => v.voice_id === value)) select.value = value;
+  select.disabled = state.downloading;
+}
+
+function renderAudioSection() {
+  const sel = $('message');
+  const btn = $('download');
+  const reload = $('reloadPage');
+  const info = $('audioInfo');
+  const format = $('audioFormat');
+  const whole = $('wholeDialog');
+  const list = state.messages || [];
+  const voices = state.voices && Array.isArray(state.voices.voices) ? state.voices.voices : [];
+
+  if (state.bridgeOutdated || state.messagesEmpty) $('audioBox').open = true;
+
+  format.value = state.audioFormat;
+  format.disabled = state.downloading;
+  whole.checked = state.wholeDialog;
+  whole.disabled = state.downloading || !list.length;
+  fillVoiceSelect($('assistantVoice'), state.assistantVoice, voices);
+  fillVoiceSelect($('userVoice'), state.userVoice, voices);
+
+  if (!list.length) {
+    let key = 'loading';
+    if (state.messagesTried) {
+      if (state.bridgeOutdated) key = 'audioReload';
+      else if (state.sessionMissing) key = 'openConversation';
+      else if (state.mode !== 'ready') key = 'audioUnavailable';
+      else key = 'noMessages';
+    }
+    sel.innerHTML = `<option>${esc(t(key))}</option>`;
+    sel.disabled = true;
+    btn.disabled = true;
+    btn.textContent = t(state.audioFormat === 'wav' ? 'downloadWav' : 'downloadMp3');
+    reload.hidden = !(state.bridgeOutdated || state.messagesEmpty);
+    reload.disabled = false;
+    info.textContent = '';
+    return;
+  }
+
+  const ordered = [...list].reverse();
+  if (!ordered.some((m) => m.id === state.selectedMessage)) state.selectedMessage = ordered[0].id;
+  sel.innerHTML = ordered.map((m) => `<option value="${esc(m.id)}">${esc(messageLabel(m))}</option>`).join('');
+  sel.value = state.selectedMessage;
+  sel.disabled = state.downloading || state.wholeDialog;
+  btn.disabled = state.downloading;
+  btn.textContent = state.downloading
+    ? t('downloading')
+    : t(state.audioFormat === 'wav' ? 'downloadWav' : 'downloadMp3');
+  reload.hidden = true;
+  info.textContent = state.wholeDialog ? t('dialogHint') : t('downloadHint');
+}
+
+function renderAudioMsg() {
+  const el = $('audioMsg');
+  if (!state.audioMsg) {
+    el.innerHTML = '';
+    return;
+  }
+  const vars = {};
+  for (const [key, value] of Object.entries(state.audioMsg.vars || {})) vars[key] = esc(value);
+  el.innerHTML = `<span class="${state.audioMsg.cls}">${t(state.audioMsg.key, vars)}</span>`;
+}
+
+function render() {
+  applyStatic();
+  renderLangSelects();
+  renderStatus();
+  renderVoiceSection();
+  renderMsg();
+  renderAudioSection();
+  renderAudioMsg();
+}
+
+/* ---------- 扩展 API ---------- */
 
 async function activeTab() {
   const tabs = await api.tabs.query({ active: true, currentWindow: true });
@@ -37,95 +540,381 @@ async function hasHostPermission() {
   try { return await api.permissions.contains({ origins: ORIGINS }); } catch { return true; }
 }
 
-(async () => {
-  const tab = await activeTab();
-  if (!tab || !/^https:\/\/chat\.deepseek\.com\//.test(tab.url || '')) {
-    $('dot').className = 'dot off';
-    $('page').innerHTML = '当前标签页不是 <code>chat.deepseek.com</code>，切过去再点我。';
-    $('gray').textContent = '';
+/* ---------- 操作 ---------- */
+
+async function grantAccess() {
+  if (!state.tab) return;
+  state.granting = true;
+  render();
+  try {
+    await api.permissions.request({ origins: ORIGINS });
+  } catch (e) {
+    state.granting = false;
+    setMsg('grantFailed', { err: shortJson((e && e.message) || e) }, 'bad');
+    render();
+    return;
+  }
+  if (await hasHostPermission()) {
+    setMsg('grantedReloading', null, 'ok');
+    render();
+    try { await api.tabs.reload(state.tab.id); } catch { /* 忽略 */ }
+    setTimeout(() => window.close(), 500);
+  } else {
+    state.granting = false;
+    setMsg('notGranted', null, 'bad');
+    render();
+  }
+}
+
+async function saveVoice() {
+  if (!state.tab || !state.selectedVoice) return;
+  const voiceId = state.selectedVoice;
+  const voice = selectedVoice();
+  const name = voice ? voiceText(voice, state.voiceLang).name : voiceId;
+
+  state.saving = true;
+  stopAudio();
+  setMsg('switching');
+  render();
+  const res = await send(state.tab.id, { type: 'setVoice', voiceId });
+  const code = res.ok && res.data && res.data.code === 0 ? res.data.data.biz_code : null;
+  if (code === 0) {
+    if (state.voices) state.voices.current_voice_id = voiceId;
+    setMsg('switched', { name }, 'ok');
+  } else {
+    const detail = (res.data && res.data.data) || res.data || res.error || 'unknown';
+    setMsg('switchFailed', { err: shortJson(detail) }, 'bad');
+  }
+  state.saving = false;
+  render();
+}
+
+function stopAudio() {
+  if (!state.audio) return;
+  try { state.audio.pause(); } catch { /* 忽略 */ }
+  state.audio = null;
+}
+
+function previewVoice() {
+  const voice = selectedVoice();
+  const url = voice ? demoUrl(voice, state.voiceLang) : null;
+  if (!url) {
+    setMsg('previewMissing', null, 'bad');
+    renderMsg();
+    return;
+  }
+  stopAudio();
+  try {
+    const audio = new Audio(url);
+    state.audio = audio;
+    audio.addEventListener('ended', () => {
+      if (state.audio === audio) state.audio = null;
+    });
+    audio.addEventListener('error', () => {
+      if (state.audio === audio) state.audio = null;
+      setMsg('previewFailed', { err: 'media error' }, 'bad');
+      renderMsg();
+    });
+    setMsg('previewPlaying', { name: voiceText(voice, state.voiceLang).name, lang: langName(state.voiceLang) }, 'ok');
+    renderMsg();
+    audio.play().catch((e) => {
+      if (state.audio === audio) state.audio = null;
+      setMsg('previewFailed', { err: shortJson((e && e.message) || e) }, 'bad');
+      renderMsg();
+    });
+  } catch (e) {
+    setMsg('previewFailed', { err: shortJson((e && e.message) || e) }, 'bad');
+    renderMsg();
+  }
+}
+
+async function resetCache() {
+  if (!state.tab) return;
+  $('reset').disabled = true;
+  stopAudio();
+  setMsg('resetting');
+  renderMsg();
+  await send(state.tab.id, { type: 'reset' });
+}
+
+async function reloadPage() {
+  if (!state.tab) return;
+  try { await api.tabs.reload(state.tab.id); } catch { /* 忽略 */ }
+  setTimeout(() => window.close(), 300);
+}
+
+async function loadMessages(tabId) {
+  state.messagesTried = true;
+  const res = await send(tabId, { type: 'messages' });
+  if (res && res.ok && res.data && Array.isArray(res.data.messages)) {
+    state.messages = res.data.messages;
+    state.sessionMissing = false;
+    state.messagesEmpty = state.messages.length === 0;
+    if (state.messages.length) {
+      state.selectedMessage = state.messages[state.messages.length - 1].id;
+    } else {
+      setAudioMsg('noMessagesHint');
+    }
+  } else if (res && res.error === 'no-session') {
+    state.sessionMissing = true;
+  } else if (res && /unknown message/i.test(res.error || '')) {
+    // 老版 content script 不认识 messages：刷新页面即可
+    state.bridgeOutdated = true;
+    setAudioMsg('bridgeOutdated', null, 'bad');
+  } else {
+    setAudioMsg('messagesFailed', { err: shortJson((res && res.error) || res) }, 'bad');
+  }
+  renderAudioSection();
+  renderAudioMsg();
+}
+
+function roleVoiceFor(role) {
+  if (state.voices && Array.isArray(state.voices.voices)) {
+    const ids = new Set(state.voices.voices.map((v) => v.voice_id));
+    const want = role === 'user' ? state.userVoice : state.assistantVoice;
+    if (want && ids.has(want)) return want;
+  }
+  return null;
+}
+
+function timestampName() {
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+}
+
+function ttsErrorKey(code) {
+  if (typeof code !== 'number') return null;
+  const key = 'ttsError' + code;
+  const dict = I18N[state.uiLang] || I18N.en;
+  return dict[key] != null ? key : null;
+}
+
+async function downloadAudio() {
+  if (!state.tab || state.downloading) return;
+  const all = Array.isArray(state.messages) ? state.messages : [];
+  const single = all.find((m) => m.id === state.selectedMessage) || null;
+  const items = state.wholeDialog ? all.slice(-20) : (single ? [single] : []);
+  if (!items.length) return;
+
+  const whole = state.wholeDialog;
+  const format = state.audioFormat === 'wav' ? 'wav' : 'mp3';
+  state.downloading = true;
+  stopAudio();
+  setAudioMsg(whole ? 'downloadProgress' : 'keepOpen', whole ? { done: 0, total: items.length } : null);
+  renderAudioSection();
+  renderAudioMsg();
+
+  const chunks = [];
+  const skipped = [];
+  let totalSeconds = 0;
+  let lastError = null;
+
+  try {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (whole) {
+        setAudioMsg('downloadProgress', { done: i, total: items.length }, 'muted');
+        renderAudioMsg();
+      }
+      const res = await send(state.tab.id, {
+        type: 'download',
+        messageId: item.id,
+        voiceId: roleVoiceFor(item.role) || undefined,
+        keepVoice: true,
+      });
+      if (res && res.ok && res.data && res.data.audio) {
+        chunks.push(base64ToBytes(res.data.audio));
+        totalSeconds += Number(res.data.seconds || 0);
+      } else {
+        lastError = res;
+        skipped.push(item.id);
+        if (!whole) break;
+      }
+      if (whole && i < items.length - 1) await new Promise((r) => setTimeout(r, 120));
+    }
+  } finally {
+    try { await send(state.tab.id, { type: 'restoreVoice' }); } catch { /* 忽略 */ }
+  }
+
+  state.downloading = false;
+
+  if (!chunks.length) {
+    const key = ttsErrorKey(lastError && lastError.code);
+    if (key) setAudioMsg(key, null, 'bad');
+    else setAudioMsg('downloadFailed', { err: shortJson((lastError && lastError.error) || lastError || 'empty') }, 'bad');
+    renderAudioSection();
+    renderAudioMsg();
     return;
   }
 
+  try {
+    const pcm = concatPcm(chunks);
+    let blob;
+    let ext;
+    if (format === 'wav') {
+      blob = new Blob([pcmToWavBytes(pcm)], { type: 'audio/wav' });
+      ext = 'wav';
+    } else {
+      setAudioMsg('mp3Encoding');
+      renderAudioMsg();
+      await new Promise((r) => setTimeout(r, 30));
+      blob = encodeMp3(pcm);
+      ext = 'mp3';
+    }
+    const prefix = whole ? 'deepseek-dialog' : 'deepseek-tts';
+    saveBlob(blob, `${prefix}-${timestampName()}.${ext}`);
+    if (skipped.length) {
+      setAudioMsg('dialogDoneSkipped', {
+        sec: totalSeconds.toFixed(1),
+        size: formatSize(blob.size),
+        n: skipped.length,
+      }, 'ok');
+    } else {
+      setAudioMsg('downloadDone', {
+        sec: totalSeconds.toFixed(1),
+        size: formatSize(blob.size),
+      }, 'ok');
+    }
+  } catch (e) {
+    setAudioMsg('downloadFailed', { err: shortJson((e && e.message) || e) }, 'bad');
+  }
+
+  renderAudioSection();
+  renderAudioMsg();
+}
+
+/* ---------- 事件 ---------- */
+
+function bind() {
+  $('uiLang').addEventListener('change', () => {
+    const previous = state.uiLang;
+    state.uiLang = $('uiLang').value;
+    if (state.voiceLang === previous && availableVoiceLangs().includes(state.uiLang)) {
+      state.voiceLang = state.uiLang;
+    }
+    stopAudio();
+    persistSettings();
+    render();
+  });
+
+  $('voiceLang').addEventListener('change', () => {
+    state.voiceLang = $('voiceLang').value;
+    stopAudio();
+    persistSettings();
+    render();
+  });
+
+  $('voice').addEventListener('change', () => {
+    state.selectedVoice = $('voice').value;
+    stopAudio();
+    renderVoiceSection();
+  });
+
+  $('message').addEventListener('change', () => {
+    state.selectedMessage = $('message').value;
+    state.audioMsg = null;
+    renderAudioMsg();
+  });
+
+  $('assistantVoice').addEventListener('change', () => {
+    state.assistantVoice = $('assistantVoice').value;
+    persistSettings();
+  });
+
+  $('userVoice').addEventListener('change', () => {
+    state.userVoice = $('userVoice').value;
+    persistSettings();
+  });
+
+  $('audioFormat').addEventListener('change', () => {
+    state.audioFormat = $('audioFormat').value === 'wav' ? 'wav' : 'mp3';
+    persistSettings();
+    renderAudioSection();
+  });
+
+  $('wholeDialog').addEventListener('change', () => {
+    state.wholeDialog = $('wholeDialog').checked;
+    persistSettings();
+    renderAudioSection();
+  });
+
+  $('save').onclick = saveVoice;
+  $('preview').onclick = previewVoice;
+  $('download').onclick = downloadAudio;
+  $('reloadPage').onclick = reloadPage;
+  $('reset').onclick = resetCache;
+  $('grant').onclick = grantAccess;
+}
+
+/* ---------- 启动 ---------- */
+
+(async () => {
+  loadSettings();
+  bind();
+  render();
+
+  const tab = await activeTab();
+  if (!tab || !/^https:\/\/chat\.deepseek\.com\//.test(tab.url || '')) {
+    state.mode = 'wrongTab';
+    state.messagesTried = true;
+    state.sessionMissing = true;
+    render();
+    return;
+  }
+  state.tab = tab;
+
   if (!(await hasHostPermission())) {
-    $('dot').className = 'dot off';
-    $('page').innerHTML = '还差一步：<strong>允许本扩展访问 chat.deepseek.com</strong>';
-    const grant = $('grant');
-    grant.hidden = false;
-    grant.onclick = async () => {
-      grant.disabled = true;
-      try {
-        await api.permissions.request({ origins: ORIGINS });
-      } catch (e) {
-        setMsg('请求权限失败：' + e, 'bad');
-        grant.disabled = false;
-        return;
-      }
-      if (await hasHostPermission()) {
-        setMsg('已授权，正在刷新页面…', 'ok');
-        try { await api.tabs.reload(tab.id); } catch { /* 忽略 */ }
-        setTimeout(() => window.close(), 500);
-      } else {
-        setMsg('没拿到授权。可以到 <code>about:addons</code> → 本扩展 → 权限，手动允许站点访问。', 'bad');
-        grant.disabled = false;
-      }
-    };
-    setMsg('Firefox 的站点访问权限是可选项，点上面的按钮授权即可。', 'muted');
+    state.mode = 'noPermission';
+    state.messagesTried = true;
+    setMsg('ffPermHint');
+    render();
     return;
   }
 
   const st = await send(tab.id, { type: 'status' });
   if (!st.ok) {
-    $('dot').className = 'dot off';
-    $('page').innerHTML = '还没注入成功：<strong>刷新一下页面</strong>（装完插件后必须刷新）。';
-    setMsg(st.error || '', 'bad');
+    state.mode = 'notInjected';
+    state.messagesTried = true;
+    if (st.error) setRawMsg(st.error, 'bad');
+    render();
     return;
   }
 
-  $('dot').className = 'dot ' + (st.installed ? 'on' : 'off');
-  $('page').innerHTML = st.installed
-    ? '解锁状态：<span class="ok">已生效</span>　' + (st.hasToken ? '已登录' : '<span class="bad">未登录</span>')
-    : '<span class="bad">未生效</span>（刷新页面试试）';
+  state.mode = 'ready';
+  state.st = st;
+  state.bridgeOutdated = !(typeof st.bridgeVersion === 'number' && st.bridgeVersion >= 4);
 
-  const g = st.gray;
-  $('reset').onclick = async () => {
-    $('reset').disabled = true;
-    setMsg('已清掉本地缓存，刷新中…');
-    await send(tab.id, { type: 'reset' });
-  };
-  if (g && g.models) {
-    const grayed = g.models.some((m) => m.gray);
-    $('gray').innerHTML = grayed
-      ? '账号灰度状态：<span class="ok">本来就有朗读</span>'
-      : '账号灰度状态：<span class="muted">官方没灰度到你</span> —— 已由插件接管';
-    $('gray').innerHTML += `<ul id="models">${g.models
-      .map((m) => `<li>${esc(m.model)}${m.enabled ? '' : '（关闭）'} · tts_feature = ${m.gray}</li>`)
-      .join('')}</ul>`;
+  const voicesRes = await send(tab.id, { type: 'voices' });
+  state.voicesTried = true;
+  const data = voicesRes.ok && voicesRes.data && voicesRes.data.code === 0
+    && voicesRes.data.data && voicesRes.data.data.biz_code === 0
+    ? voicesRes.data.data.biz_data
+    : null;
+
+  if (data && Array.isArray(data.voices)) {
+    state.voices = data;
+    const langs = new Set();
+    data.voices.forEach((voice) => voiceLanguages(voice).forEach((code) => langs.add(code)));
+    state.voiceLangs = [...langs];
+    state.selectedVoice = data.current_voice_id || (data.voices[0] && data.voices[0].voice_id) || null;
+    const ids = new Set(data.voices.map((v) => v.voice_id));
+    if (!ids.has(state.assistantVoice)) state.assistantVoice = state.selectedVoice;
+    if (!ids.has(state.userVoice)) state.userVoice = state.selectedVoice;
+    reconcileVoiceLang();
   } else {
-    $('gray').textContent = '还没拿到远程配置缓存，刷新一次页面。';
+    const detail = voicesRes.ok ? (voicesRes.data && (voicesRes.data.data || voicesRes.data)) : voicesRes.error;
+    setMsg('voicesFailed', { err: shortJson(detail) }, 'bad');
   }
 
-  // 音色
-  const vr = await send(tab.id, { type: 'voices' });
-  const sel = $('voice'), save = $('save');
-  const j = vr.ok ? vr.data : null;
-  if (!j || j.code !== 0 || !j.data || j.data.biz_code !== 0) {
-    sel.innerHTML = '<option>取音色失败</option>';
-    setMsg('取音色列表失败：' + esc(JSON.stringify(j || vr.error).slice(0, 160)), 'bad');
-    return;
+  state.sessionMissing = !/\/a\/chat\/s\//.test(st.href || '');
+  if (state.bridgeOutdated) {
+    state.messagesTried = true;
+    setAudioMsg('bridgeOutdated', null, 'bad');
+  } else if (state.sessionMissing) {
+    state.messagesTried = true;
+  } else {
+    await loadMessages(tab.id);
   }
-  const info = j.data.biz_data;
-  sel.innerHTML = info.voices
-    .map((v) => `<option value="${esc(v.voice_id)}"${v.voice_id === info.current_voice_id ? ' selected' : ''}>${esc(VOICE_ZH[v.voice_id] || (v.name_i18n && v.name_i18n.zh) || v.voice_id)}</option>`)
-    .join('');
-  sel.disabled = false;
-  save.disabled = false;
-  save.onclick = async () => {
-    save.disabled = true;
-    setMsg('切换中…');
-    const r = await send(tab.id, { type: 'setVoice', voiceId: sel.value });
-    const code = r.ok && r.data && r.data.code === 0 ? r.data.data.biz_code : null;
-    if (code === 0) setMsg('已切换为 ' + (VOICE_ZH[sel.value] || sel.value), 'ok');
-    else setMsg('切换失败：' + esc(JSON.stringify((r.data && r.data.data) || r.error).slice(0, 160)), 'bad');
-    save.disabled = false;
-  };
+  render();
 })();
